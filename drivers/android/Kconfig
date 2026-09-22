@@ -54,6 +54,15 @@ config ANDROID_BINDER_IPC_SELFTEST
 	  exhaustively with combinations of various buffer sizes and
 	  alignments.
 
+config ANDROID_SIMPLE_LMK
+	bool "Simple Android Low Memory Killer"
+	depends on MMU && !ANDROID_LOW_MEMORY_KILLER && !MEMCG && !PSI
+	help
+	  Kernel-side low memory killer based on global VM pressure.
+	  Reclaims first and kills one Android process at a time only when
+	  reclaim cannot satisfy the configured memory target.
+
+
 endif # if ANDROID
 
 endmenu

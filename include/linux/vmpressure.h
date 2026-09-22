@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/cgroup.h>
 #include <linux/eventfd.h>
+#include <linux/notifier.h>
 
 struct vmpressure {
 	unsigned long scanned;
@@ -16,6 +17,7 @@ struct vmpressure {
 
 	unsigned long tree_scanned;
 	unsigned long tree_reclaimed;
+	unsigned long stall;
 	/* The lock is used to keep the scanned/reclaimed above in sync. */
 	struct spinlock sr_lock;
 
@@ -25,17 +27,25 @@ struct vmpressure {
 	struct mutex events_lock;
 
 	struct work_struct work;
+
+	atomic_long_t users;
+	rwlock_t users_lock;
 };
 
 struct mem_cgroup;
 
-#ifdef CONFIG_MEMCG
+extern int vmpressure_notifier_register(struct notifier_block *nb);
+extern int vmpressure_notifier_unregister(struct notifier_block *nb);
 extern void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
-		       unsigned long scanned, unsigned long reclaimed);
-extern void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio);
-
+		       unsigned long scanned, unsigned long reclaimed, int order);
+extern void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio,
+			    int order);
+extern bool vmpressure_inc_users(int order);
+extern void vmpressure_dec_users(void);
 extern void vmpressure_init(struct vmpressure *vmpr);
 extern void vmpressure_cleanup(struct vmpressure *vmpr);
+
+#ifdef CONFIG_MEMCG
 extern struct vmpressure *memcg_to_vmpressure(struct mem_cgroup *memcg);
 extern struct cgroup_subsys_state *vmpressure_to_css(struct vmpressure *vmpr);
 extern int vmpressure_register_event(struct mem_cgroup *memcg,
@@ -44,9 +54,9 @@ extern int vmpressure_register_event(struct mem_cgroup *memcg,
 extern void vmpressure_unregister_event(struct mem_cgroup *memcg,
 					struct eventfd_ctx *eventfd);
 #else
-static inline void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
-			      unsigned long scanned, unsigned long reclaimed) {}
-static inline void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg,
-				   int prio) {}
+static inline struct vmpressure *memcg_to_vmpressure(struct mem_cgroup *memcg)
+{
+	return NULL;
+}
 #endif /* CONFIG_MEMCG */
 #endif /* __LINUX_VMPRESSURE_H */
