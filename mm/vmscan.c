@@ -2442,6 +2442,33 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 
 	scan_balance = SCAN_FRACT;
 
+#ifdef CONFIG_EXPERIMENTAL_ZRAM_RECLAIM
+	/*
+	 * Experimental: favor anonymous reclaim more strongly when a swap
+	 * device (i.e. the ZRAM block device set up as swap) is actually
+	 * available, so anon pages get pushed into ZRAM more readily under
+	 * pressure instead of leaning on file-cache reclaim alone.
+	 *
+	 * This only touches the SCAN_FRACT weighting below (anon_prio /
+	 * file_prio) -- every safety exit above is already unchanged and
+	 * still applies first:
+	 *   - no swap space / sc->may_swap false  -> SCAN_FILE (unaffected)
+	 *   - swappiness == 0 under memcg          -> SCAN_FILE (unaffected)
+	 *   - near-OOM priority 0                  -> SCAN_EQUAL (unaffected)
+	 *   - anon-thrash / file-cache-trap guards  -> unaffected
+	 * so this can never cause anon reclaim when swap is unavailable,
+	 * and never overrides the existing file-cache protection logic --
+	 * it only shifts the SCAN_FRACT ap/fp ratio in the case where the
+	 * kernel had already decided both LRUs are fair game.
+	 */
+	if (swappiness && mem_cgroup_get_nr_swap_pages(memcg) > 0) {
+		unsigned long boosted = swappiness +
+			CONFIG_EXPERIMENTAL_ZRAM_RECLAIM_BOOST;
+
+		swappiness = min_t(unsigned long, boosted, 200);
+	}
+#endif
+
 	/*
 	 * With swappiness at 100, anonymous and file have the same priority.
 	 * This scanning priority is essentially the inverse of IO cost.

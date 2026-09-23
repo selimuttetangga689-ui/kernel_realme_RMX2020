@@ -896,3 +896,46 @@ config PHYSICAL_ANTI_FRAGMENTATION
 	 Turn on the function of Physical memory anti-fragmentation.
 #endif /* OPLUS_FEATURE_MULTI_FREEAREA */
 
+config EXPERIMENTAL_ZRAM_RECLAIM
+	bool "Experimental: favor anonymous (ZRAM) reclaim under pressure"
+	depends on SWAP
+	default n
+	help
+	  This is an experimental, opt-in tuning of the anon/file LRU
+	  scan-balance decision in mm/vmscan.c's get_scan_count(). When a
+	  swap device is actually active (e.g. this target's ZRAM device
+	  configured as swap), the effective swappiness used for the
+	  SCAN_FRACT anon/file weighting is boosted by
+	  EXPERIMENTAL_ZRAM_RECLAIM_BOOST (clamped to 200), so anonymous
+	  pages are reclaimed (i.e. pushed into ZRAM) more readily relative
+	  to file-backed pages under memory pressure.
+
+	  This does NOT change the existing "no swap available" / "near-OOM"
+	  / file-cache-trap / low-inactive-file-list guards in
+	  get_scan_count(): those are evaluated first and still take
+	  priority, so anonymous pages are never reclaimed when no swap
+	  space is available, and file-cache reclaim behavior is otherwise
+	  unaffected. It has no effect on systems without an active swap
+	  device.
+
+	  This is experimental. It does not touch MEMCG, PSI, the Android
+	  LMK implementation, or any allocator/watermark code. If unsure,
+	  say N.
+
+config EXPERIMENTAL_ZRAM_RECLAIM_BOOST
+	int "Swappiness boost applied by EXPERIMENTAL_ZRAM_RECLAIM"
+	depends on EXPERIMENTAL_ZRAM_RECLAIM
+	range 1 100
+	default 40
+	help
+	  Amount added to the effective swappiness value used only inside
+	  get_scan_count()'s SCAN_FRACT anon/file weighting when
+	  EXPERIMENTAL_ZRAM_RECLAIM is enabled and swap is available. Does
+	  not change /proc/sys/vm/swappiness itself. The result is clamped
+	  to 200 (the point at which file_prio would otherwise go negative).
+
+	  Higher values favor anonymous/ZRAM reclaim more strongly. The
+	  default of 40 turns a stock swappiness=60 into an effective 100
+	  (anon and file weighted equally) once swap is active, without
+	  needing to change the global swappiness sysctl.
+
