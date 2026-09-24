@@ -46,6 +46,8 @@
 
 #define pr_fmt(fmt) "simple_lmk: " fmt
 
+#include <linux/bitops.h>
+#include <linux/cpumask.h>
 #include <linux/cred.h>
 #include <linux/delay.h>
 #include <linux/freezer.h>
@@ -53,6 +55,7 @@
 #include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -94,6 +97,27 @@ static const char *slmk_ram_class __read_mostly = "unknown";
 #define SLMK_DEFAULT_MAX_KILLS_PER_CASCADE 8
 #define SLMK_DEFAULT_KILL_COOLDOWN_MS 100
 #define SLMK_DEFAULT_NO_SWAP_GRACE_MS 500
+
+/*
+ * RMX2020 (Snapdragon 680-class) big cores. CPUs 0-5 are the little
+ * cluster; CPUs 6-7 are the two big cores. This is only ever used as a
+ * *preference* for the work this driver's own reclaim thread does
+ * (direct_reclaim_pass(), which drives shrink_page_list() -> the ZRAM
+ * swap-out/compress path via zcomp_stream_get()'s get_cpu_ptr() -- see
+ * slmk_apply_reclaim_affinity() and the comment above it); it never
+ * touches kswapd, other kernel threads, or any unrelated task's
+ * affinity, and is bounds-checked at runtime against the CPUs actually
+ * present before use (see slmk_apply_reclaim_affinity()).
+ */
+#define SLMK_DEFAULT_RECLAIM_CPU_MASK (BIT(6) | BIT(7))
+
+/*
+ * Bounded extra time to let an in-flight kill's async reap/compress
+ * work land before this cascade concludes reclaim "failed" and moves
+ * on to another victim. See the comment above slmk_post_kill_grace().
+ */
+#define SLMK_DEFAULT_POST_KILL_GRACE_MS 150
+#define SLMK_POST_KILL_GRACE_POLL_MS 25
 
 /* The minimum number of pages to free per reclaim, and the recheck target */
 static unsigned short slmk_minfree __read_mostly;
@@ -145,6 +169,70 @@ static unsigned int slmk_no_swap_grace_ms __read_mostly =
 	SLMK_DEFAULT_NO_SWAP_GRACE_MS;
 module_param(slmk_no_swap_grace_ms, uint, 0644);
 #define SLMK_NO_SWAP_GRACE_POLL_MS 50
+
+/*
+ * Bounded reclaim grace given after a kill whose reap could not be
+ * confirmed before moving on to another victim within the same
+ * cascade. Runtime tunable; see slmk_post_kill_grace().
+ */
+static unsigned int slmk_post_kill_grace_ms __read_mostly =
+	SLMK_DEFAULT_POST_KILL_GRACE_MS;
+module_param(slmk_post_kill_grace_ms, uint, 0644);
+
+/*
+ * CPU affinity preference (bitmask) for this driver's own reclaim
+ * kthread only -- see slmk_apply_reclaim_affinity(). A custom
+ * kernel_param_ops is used (rather than a plain module_param()) so
+ * that changing this after boot re-applies immediately to the
+ * already-running thread instead of requiring a reboot, per the
+ * runtime-tunability goal for this experiment. Writing 0 disables the
+ * preference entirely and leaves the thread's affinity at whatever the
+ * scheduler default is.
+ */
+static unsigned int slmk_reclaim_cpu_mask __read_mostly =
+	SLMK_DEFAULT_RECLAIM_CPU_MASK;
+static struct task_struct *slmk_reclaim_task;
+static DEFINE_MUTEX(slmk_reclaim_task_mutex);
+static void slmk_apply_reclaim_affinity(struct task_struct *tsk,
+					 unsigned int mask_bits);
+
+static int slmk_reclaim_cpu_mask_set(const char *val,
+				      const struct kernel_param *kp)
+{
+	unsigned int mask;
+	int ret;
+
+	ret = kstrtouint(val, 0, &mask);
+	if (ret)
+		return ret;
+
+	slmk_reclaim_cpu_mask = mask;
+
+	/*
+	 * Re-apply to the live thread if it has already started. This
+	 * can block (set_cpus_allowed_ptr() may wait on a stop_one_cpu()
+	 * migration), which is fine here: module param .set callbacks
+	 * run in sysfs-write (process) context, not atomic context.
+	 */
+	mutex_lock(&slmk_reclaim_task_mutex);
+	if (slmk_reclaim_task)
+		slmk_apply_reclaim_affinity(slmk_reclaim_task, mask);
+	mutex_unlock(&slmk_reclaim_task_mutex);
+
+	return 0;
+}
+
+static int slmk_reclaim_cpu_mask_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "0x%x\n", slmk_reclaim_cpu_mask);
+}
+
+static const struct kernel_param_ops slmk_reclaim_cpu_mask_ops = {
+	.set = slmk_reclaim_cpu_mask_set,
+	.get = slmk_reclaim_cpu_mask_get,
+};
+module_param_cb(slmk_reclaim_cpu_mask, &slmk_reclaim_cpu_mask_ops,
+		&slmk_reclaim_cpu_mask, 0644);
 
 /* Maximum number of UIDs that can be marked protected at once */
 #define SLMK_MAX_PROTECTED 64
@@ -469,6 +557,73 @@ static bool memory_target_met(void)
 	return global_zone_page_state(NR_FREE_PAGES) >= MIN_FREE_PAGES;
 }
 
+/*
+ * Prefer the big cores (CPU 6-7 on RMX2020) for this driver's own
+ * reclaim kthread, which is the thread that calls direct_reclaim_pass()
+ * both from run_reclaim_cascade() and from slmk_post_kill_grace()
+ * below. try_to_free_pages() -> shrink_page_list() -> pageout() enters
+ * the ZRAM swap-out path synchronously on whichever CPU is running at
+ * the time; zcomp_stream_get() (drivers/block/zram/zcomp.c) then takes
+ * that CPU's per-CPU compression stream via get_cpu_ptr(). There is no
+ * separate compression worker in this tree's zcomp -- compression runs
+ * inline in the caller -- so the *only* safe, targeted way to steer
+ * this driver's own reclaim-triggered compression onto the big cores
+ * is to steer the calling thread itself. This is deliberately scoped
+ * to that one kthread:
+ *
+ *   - kswapd's own background reclaim is untouched and keeps its
+ *     normal (unpinned) affinity, so ordinary allocator-path reclaim
+ *     is not perturbed and little cores are not starved of it.
+ *   - No global scheduler policy, cpuset, or other task's affinity is
+ *     touched.
+ *   - The reaper thread (simple_lmk_reaper_thread) is left unpinned:
+ *     __oom_reap_task_mm() unmaps already-resident pages and does not
+ *     itself invoke the compressor, so pinning it would not help and
+ *     would only reduce its scheduling flexibility.
+ *
+ * mask_bits is validated against cpu_possible_mask at call time rather
+ * than assumed, so an out-of-range mask (wrong topology, or a bad
+ * value written to the runtime tunable) safely falls back to leaving
+ * the thread's affinity untouched instead of silently doing nothing
+ * useful or, worse, being applied against nonexistent CPUs.
+ */
+static void slmk_apply_reclaim_affinity(struct task_struct *tsk,
+					 unsigned int mask_bits)
+{
+	cpumask_var_t mask;
+	unsigned int cpu;
+
+	/* 0 means "no preference"; leave the thread's affinity alone */
+	if (!mask_bits)
+		return;
+
+	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+		return;
+
+	cpumask_clear(mask);
+	for_each_possible_cpu(cpu) {
+		if (mask_bits & BIT(cpu))
+			cpumask_set_cpu(cpu, mask);
+	}
+
+	if (!cpumask_intersects(mask, cpu_possible_mask)) {
+		pr_warn_ratelimited("reclaim_cpu_mask 0x%x matches no CPU present on this device (nr_cpu_ids=%u); leaving reclaim thread unpinned\n",
+				    mask_bits, nr_cpu_ids);
+		goto out;
+	}
+
+	cpumask_and(mask, mask, cpu_possible_mask);
+
+	if (set_cpus_allowed_ptr(tsk, mask))
+		pr_warn_ratelimited("failed to set reclaim thread CPU affinity to 0x%x\n",
+				    mask_bits);
+	else
+		pr_info("reclaim thread affined to CPU mask 0x%x\n",
+			cpumask_bits(mask)[0]);
+out:
+	free_cpumask_var(mask);
+}
+
 /* ---------------------------------------------------------------------
  * Kill path: exactly one victim at a time, with a real recheck between
  * each kill.
@@ -501,12 +656,19 @@ static void record_last_victim(const char *comm, kuid_t uid, int adj,
 	spin_unlock(&last_victim_lock);
 }
 
-static void kill_single_victim(struct victim_info *victim)
+/*
+ * Returns true if the victim's reap was confirmed (reap_done completed
+ * before RECLAIM_EXPIRES), false if we gave up waiting and proceeded on
+ * a timeout. See slmk_post_kill_grace() for why the caller cares about
+ * this distinction.
+ */
+static bool kill_single_victim(struct victim_info *victim)
 {
 	struct task_struct *t, *vtsk = victim->tsk;
 	struct mm_struct *mm = victim->mm;
 	kuid_t uid = victim->uid;
 	unsigned long kib = victim->size << (PAGE_SHIFT - 10);
+	bool reaped_confirmed;
 
 	pr_info_ratelimited("Killing %s (uid %u) with adj %d to free %lu KiB\n",
 			     vtsk->comm, from_kuid(&init_user_ns, uid),
@@ -568,10 +730,13 @@ static void kill_single_victim(struct victim_info *victim)
 		wake_up(&reaper_waitq);
 
 	/* Wait until the victim dies or until the timeout is reached */
-	if (!wait_for_completion_timeout(&reap_done, RECLAIM_EXPIRES))
+	if (!wait_for_completion_timeout(&reap_done, RECLAIM_EXPIRES)) {
 		pr_info_ratelimited("Timeout hit waiting for victim to die, proceeding\n");
-	else
+		reaped_confirmed = false;
+	} else {
 		msleep(SLEEP_DURATION_MS);
+		reaped_confirmed = true;
+	}
 
 	reinit_completion(&reap_done);
 	clear_active_victim();
@@ -589,6 +754,39 @@ static void kill_single_victim(struct victim_info *victim)
 	/* Release the references find_victims() took on our behalf */
 	mmput(mm);
 	put_task_struct(vtsk);
+
+	return reaped_confirmed;
+}
+
+/*
+ * When kill_single_victim() could not confirm the reap before its
+ * timeout, we do not yet know whether that kill actually helped --
+ * exit_mmap() and the reaper's __oom_reap_task_mm() are asynchronous,
+ * and the immediately-following memory_target_met() recheck in
+ * scan_and_kill_one_at_a_time() can easily still read stale (pre-reap)
+ * free-page counts. Treating that as "reclaim already failed" and
+ * moving straight to another victim is exactly the over-kill pattern
+ * seen in testing (repeated "Timeout hit waiting for victim to die"
+ * followed by another kill in the same cascade).
+ *
+ * Give it a short, hard-bounded window instead: keep running light
+ * direct_reclaim_pass() calls (which also folds in whatever the
+ * now-dying victim has released so far) and re-checking the real
+ * target, rather than immediately re-entering the kill loop. This is
+ * strictly bounded by slmk_post_kill_grace_ms (a handful of
+ * SLMK_POST_KILL_GRACE_POLL_MS steps) and always exits promptly the
+ * moment memory recovers, so it cannot become an unbounded reclaim
+ * loop and does not block indefinitely.
+ */
+static void slmk_post_kill_grace(void)
+{
+	unsigned int waited = 0;
+
+	while (waited < slmk_post_kill_grace_ms && !memory_target_met()) {
+		direct_reclaim_pass();
+		msleep(SLMK_POST_KILL_GRACE_POLL_MS);
+		waited += SLMK_POST_KILL_GRACE_POLL_MS;
+	}
 }
 
 /*
@@ -614,6 +812,8 @@ static void scan_and_kill_one_at_a_time(void)
 	}
 
 	for (i = 0; i < nr_found; i++) {
+		bool confirmed;
+
 		/*
 		 * Stop as soon as EITHER:
 		 *  - real free memory has recovered,
@@ -626,8 +826,21 @@ static void scan_and_kill_one_at_a_time(void)
 			break;
 
 		recovered_estimate += victims[i].size;
-		kill_single_victim(&victims[i]);
+		confirmed = kill_single_victim(&victims[i]);
 		killed++;
+
+		/*
+		 * If we don't yet know whether that kill actually freed
+		 * anything (timeout, not a confirmed reap), give reclaim a
+		 * short bounded chance to catch up before the next loop
+		 * iteration's memory_target_met() check decides we need
+		 * another victim. A confirmed reap already ran an extra
+		 * direct_reclaim_pass() with real freed memory behind it
+		 * (see kill_single_victim()), so it goes straight to the
+		 * next recheck without this extra wait.
+		 */
+		if (!confirmed)
+			slmk_post_kill_grace();
 	}
 
 	/* Every candidate was pinned by find_victims(); release any that
@@ -712,6 +925,17 @@ static int simple_lmk_reclaim_thread(void *data)
 	/* Use maximum RT priority */
 	set_task_rt_prio(current, MAX_RT_PRIO - 1);
 	set_freezable();
+
+	/*
+	 * Publish ourselves so the slmk_reclaim_cpu_mask module param can
+	 * re-affine us live if it is changed after this point, then apply
+	 * whatever preference is currently configured. See the comment
+	 * above slmk_apply_reclaim_affinity().
+	 */
+	mutex_lock(&slmk_reclaim_task_mutex);
+	slmk_reclaim_task = current;
+	mutex_unlock(&slmk_reclaim_task_mutex);
+	slmk_apply_reclaim_affinity(current, slmk_reclaim_cpu_mask);
 
 	while (1) {
 		bool critical;
