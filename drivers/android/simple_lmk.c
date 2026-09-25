@@ -3,6 +3,7 @@
  * Copyright (C) 2019-2023 Sultan Alsawaf <sultan@kerneltoast.com>.
  *
  * Reclaim-first / one-victim-at-a-time rework, 2026.
+ * Reclaim-progress-gated kill hotfix, 2026 (see below).
  *
  * Design summary (see ANALYSIS_AND_NOTES.md for full rationale and the
  * verification performed against this 4.19 vendor tree before writing
@@ -19,23 +20,49 @@
  *        +---- target met ----> done, no kill
  *        |
  *        v
+ *   measure reclaim PROGRESS, not just whether a round budget elapsed:
+ *   compare real VM counters (pages actually stolen/reclaimed, pages
+ *   swapped out, NR_FREE_PAGES) from before this reclaim window to
+ *   after it -- see slmk_reclaim_snapshot()/slmk_window_productive().
+ *        |
+ *        +---- window productive ----> done, no kill; let the next
+ *        |     vmpressure-critical event give reclaim another window
+ *        v
+ *   window NOT productive: only once this has repeated for
+ *   slmk_reclaim_failure_threshold consecutive critical windows
+ *   (slmk_nonproductive_windows) is a kill authorized at all -- a
+ *   single failed window is never sufficient by itself
+ *        |
+ *        v
  *   pick ONE victim (protected UIDs excluded, oom_score_adj primary,
  *   size secondary)
  *        |
  *        v
  *   kill it, wait for reap, do one more light reclaim pass, recheck
  *        |
- *        +---- target met, OR estimated recovered size met target, ----> stop
- *        |     OR per-cascade kill cap hit
+ *        +---- real memory recovered, OR reclaim productive again ---> stop
+ *        |     after this kill, OR per-cascade kill cap hit
  *        v
  *   next victim (bounded by cooldown at the cascade level, not between
  *   individual victims within a single still-critical cascade)
  *
- * The "estimated recovered size" and per-cascade kill cap bounds exist
- * because relying on real free-memory recovery alone (memory_target_met())
- * has no natural floor if reclaim can't keep up -- a real device hit this:
- * it looped through victims until it SIGKILL'd zygote itself, causing a
- * bootloop. See scan_and_kill_one_at_a_time() for details.
+ * Earlier revisions of this rework also allowed a kill loop to stop
+ * early once the SUM of killed victims' estimated resident sizes
+ * reached the minfree target, on the theory that real free-memory
+ * recovery (memory_target_met()) has no natural floor if reclaim can't
+ * keep up. That estimate is deliberately no longer used to authorize
+ * or gate killing: an estimate of what a kill *should* free is not
+ * evidence that the VM actually recovered anything, and conflating the
+ * two was found to let cascades kill more than necessary. The
+ * documented failure mode that estimate was originally guarding
+ * against -- a real device once looped through victims until it
+ * SIGKILL'd zygote itself, causing a bootloop -- remains guarded
+ * against by slmk_max_kills_per_cascade, which is an unconditional,
+ * always-enforced hard ceiling independent of any progress or size
+ * estimate (see scan_and_kill_one_at_a_time()); the reclaim-progress
+ * gate above makes actually reaching that ceiling considerably less
+ * likely in practice, since a kill is now only ever authorized after
+ * reclaim has demonstrably, repeatedly failed to make progress.
  *
  * Protected applications are identified by Android package name in
  * userspace (PackageManager), resolved to a UID there, and pushed into
@@ -307,6 +334,17 @@ static atomic_t stat_reclaim_attempts = ATOMIC_INIT(0);
 static atomic_long_t stat_pages_freed = ATOMIC_LONG_INIT(0);
 static atomic_t stat_kill_count = ATOMIC_INIT(0);
 static atomic_t stat_protected_skips = ATOMIC_INIT(0);
+/*
+ * Reclaim-progress-gate counters (see slmk_window_productive()). A
+ * "window" here is one before/after VM-counter comparison, taken both
+ * after a cascade's bounded reclaim-round loop and after each kill
+ * within a still-unproductive cascade.
+ */
+static atomic_t stat_reclaim_windows = ATOMIC_INIT(0);
+static atomic_t stat_reclaim_productive_windows = ATOMIC_INIT(0);
+static atomic_t stat_reclaim_failed_windows = ATOMIC_INIT(0);
+static atomic_t stat_reclaim_exhaustions = ATOMIC_INIT(0);
+static atomic_t stat_kills_deferred = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(last_victim_lock);
 static char last_victim_comm[TASK_COMM_LEN];
 static unsigned int last_victim_uid;
@@ -558,6 +596,142 @@ static bool memory_target_met(void)
 }
 
 /*
+ * Below this many pages of delta, a VM counter's movement across a
+ * reclaim window is treated as noise rather than meaningful recovery.
+ * Runtime tunable; see slmk_window_productive(). Kept intentionally
+ * small and conservative -- this only needs to filter out "nothing
+ * happened", not set a real performance bar.
+ */
+#define SLMK_DEFAULT_MIN_PRODUCTIVE_PAGES 32
+static unsigned int slmk_min_productive_pages __read_mostly =
+	SLMK_DEFAULT_MIN_PRODUCTIVE_PAGES;
+module_param(slmk_min_productive_pages, uint, 0644);
+
+/*
+ * Consecutive critical reclaim windows with no meaningful progress
+ * required before a kill is authorized at all. A single failed window,
+ * or even a single failed cascade, is deliberately not sufficient --
+ * see slmk_window_productive() and the top-of-file design comment.
+ * Runtime tunable.
+ */
+#define SLMK_DEFAULT_RECLAIM_FAILURE_THRESHOLD 2
+static unsigned int slmk_reclaim_failure_threshold __read_mostly =
+	SLMK_DEFAULT_RECLAIM_FAILURE_THRESHOLD;
+module_param(slmk_reclaim_failure_threshold, uint, 0644);
+
+/*
+ * Consecutive critical reclaim windows (across cascades, and across
+ * kills within a still-unproductive cascade) that produced no
+ * meaningful progress. This is the bounded safety valve: it is simply
+ * a count of how much non-recovery has been tolerated so far, not a
+ * claim that reclaim is provably exhausted -- see
+ * slmk_reclaim_failure_threshold. Only ever touched from
+ * simple_lmk_reclaim_thread's single context (run_reclaim_cascade() and
+ * scan_and_kill_one_at_a_time() are only ever invoked from that one
+ * kthread's main loop), so no locking is needed, matching
+ * last_kill_jiffies below.
+ */
+static unsigned int slmk_nonproductive_windows;
+
+/*
+ * A snapshot of the VM counters this driver uses to tell "reclaim was
+ * attempted" apart from "reclaim produced meaningful memory-recovery
+ * progress". See slmk_reclaim_snapshot() and slmk_window_productive().
+ */
+struct slmk_reclaim_snapshot {
+	unsigned long free_pages;
+	unsigned long pgsteal;
+	unsigned long pgscan;
+	unsigned long pswpout;
+};
+
+/*
+ * try_to_free_pages()'s own return value is NOT a reliable measurement
+ * of how much memory reclaim actually recovered. In this tree's
+ * do_try_to_free_pages() (mm/vmscan.c), the return value is
+ * sc->nr_reclaimed when that is nonzero -- but when reclaim aborts
+ * early because sc->compaction_ready became true (this defconfig has
+ * CONFIG_COMPACTION=y, so that path is live), it instead returns the
+ * bare sentinel value 1, regardless of how many pages -- possibly
+ * zero -- were actually reclaimed. A caller that only checks "was the
+ * return value nonzero" (or sums several such return values across a
+ * cascade, as an earlier revision of this driver did) can therefore
+ * be misled into believing reclaim is progressing when it may not be.
+ *
+ * This instead reads real kernel-maintained VM accounting, taken
+ * immediately before and after a bounded reclaim window:
+ *
+ *   - pgsteal (PGSTEAL_DIRECT + PGSTEAL_KSWAPD): pages the reclaim
+ *     path has actually freed. In mm/vmscan.c's shrink_inactive_list(),
+ *     this is incremented by shrink_page_list()'s own return value --
+ *     i.e. it counts pages genuinely reclaimed, never as a "don't OOM"
+ *     placeholder the way try_to_free_pages()'s return value can. This
+ *     is the primary "recovery actually happened" signal, and
+ *     PGSTEAL_KSWAPD is included alongside PGSTEAL_DIRECT because
+ *     kswapd may be reclaiming concurrently with our own direct
+ *     reclaim calls; either represents real, usable memory recovered
+ *     on this system.
+ *   - pswpout: of those pages, how many were anonymous pages actually
+ *     written out to swap (zram on this device), corroborating that
+ *     pgsteal wasn't only clean file-cache being dropped.
+ *   - free_pages (NR_FREE_PAGES): included as a third, corroborating
+ *     signal, not a required one -- it can lag behind pgsteal under
+ *     sustained concurrent allocation, since freed pages are reused
+ *     immediately. Reclaim can be doing real, useful work (pgsteal/
+ *     pswpout moving) while NR_FREE_PAGES itself stays flat.
+ *
+ * PGSCAN_DIRECT/PGSCAN_KSWAPD (pages actually examined on the LRU) is
+ * also captured for diagnostic/statistics purposes -- it is useful
+ * context in the log/pr_info output for judging whether reclaim is
+ * scanning a lot while stealing little -- but is deliberately NOT used
+ * to gate the productivity decision itself: turning "pages scanned"
+ * into a scan-to-steal ratio would mean picking an arbitrary
+ * percentage threshold with no principled basis in this tree's actual
+ * behavior, which is exactly the kind of invented metric this is
+ * trying to avoid. pgsteal/pswpout/free_pages already directly answer
+ * the question that matters ("was anything usable recovered"),
+ * without needing a derived ratio.
+ *
+ * All four of NR_FREE_PAGES and the three vm_event_item counters used
+ * here are available on this defconfig (CONFIG_VM_EVENT_COUNTERS=y),
+ * and all_vm_events()/global_zone_page_state() are the same accessors
+ * this tree's own vmstat/proc code already uses to read them.
+ */
+static void slmk_reclaim_snapshot(struct slmk_reclaim_snapshot *snap)
+{
+	unsigned long events[NR_VM_EVENT_ITEMS];
+
+	all_vm_events(events);
+	snap->free_pages = global_zone_page_state(NR_FREE_PAGES);
+	snap->pgsteal = events[PGSTEAL_DIRECT] + events[PGSTEAL_KSWAPD];
+	snap->pgscan = events[PGSCAN_DIRECT] + events[PGSCAN_KSWAPD];
+	snap->pswpout = events[PSWPOUT];
+}
+
+/*
+ * Did the window between "before" and "after" recover meaningful,
+ * usable memory? See the comment above slmk_reclaim_snapshot() for
+ * what each field means and why it was chosen.
+ *
+ * pgsteal/pswpout are monotonically increasing vm_event_item counters
+ * (only ever incremented, system-wide, never reset while the system is
+ * up), so "after minus before" is always well-defined without needing
+ * to guard against wraparound in any way that matters here.
+ * free_pages (NR_FREE_PAGES) is not monotonic, so its delta is signed.
+ */
+static bool slmk_window_productive(const struct slmk_reclaim_snapshot *before,
+				    const struct slmk_reclaim_snapshot *after)
+{
+	unsigned long steal_delta = after->pgsteal - before->pgsteal;
+	unsigned long swap_delta = after->pswpout - before->pswpout;
+	long free_delta = (long)after->free_pages - (long)before->free_pages;
+
+	return steal_delta >= slmk_min_productive_pages ||
+	       swap_delta >= slmk_min_productive_pages ||
+	       free_delta >= (long)slmk_min_productive_pages;
+}
+
+/*
  * Prefer the big cores (CPU 6-7 on RMX2020) for this driver's own
  * reclaim kthread, which is the thread that calls direct_reclaim_pass()
  * both from run_reclaim_cascade() and from slmk_post_kill_grace()
@@ -802,7 +976,6 @@ module_param(slmk_max_kills_per_cascade, uint, 0644);
 static void scan_and_kill_one_at_a_time(void)
 {
 	int nr_found = 0, i;
-	unsigned long recovered_estimate = 0;
 	unsigned int killed = 0;
 
 	find_victims(&nr_found);
@@ -812,35 +985,66 @@ static void scan_and_kill_one_at_a_time(void)
 	}
 
 	for (i = 0; i < nr_found; i++) {
+		struct slmk_reclaim_snapshot before, after;
 		bool confirmed;
 
 		/*
-		 * Stop as soon as EITHER:
-		 *  - real free memory has recovered,
-		 *  - the cumulative estimated size already meets the target, or
-		 *  - the hard per-cascade kill cap has been hit.
+		 * Stop as soon as EITHER real free memory has recovered or
+		 * the hard per-cascade kill cap has been hit. Victim size
+		 * estimates are never used here to decide this -- only the
+		 * real free-memory state and the hard cap do (see the
+		 * top-of-file design comment for why the old size-sum
+		 * shortcut was removed and what still guards against the
+		 * failure mode it used to guard against).
 		 */
-		if (memory_target_met() ||
-		    recovered_estimate >= MIN_FREE_PAGES ||
-		    killed >= slmk_max_kills_per_cascade)
+		if (memory_target_met() || killed >= slmk_max_kills_per_cascade)
 			break;
 
-		recovered_estimate += victims[i].size;
+		slmk_reclaim_snapshot(&before);
+
 		confirmed = kill_single_victim(&victims[i]);
 		killed++;
 
 		/*
 		 * If we don't yet know whether that kill actually freed
 		 * anything (timeout, not a confirmed reap), give reclaim a
-		 * short bounded chance to catch up before the next loop
-		 * iteration's memory_target_met() check decides we need
-		 * another victim. A confirmed reap already ran an extra
-		 * direct_reclaim_pass() with real freed memory behind it
-		 * (see kill_single_victim()), so it goes straight to the
-		 * next recheck without this extra wait.
+		 * short bounded chance to catch up before deciding whether
+		 * another victim is needed. A confirmed reap already ran an
+		 * extra direct_reclaim_pass() with real freed memory behind
+		 * it (see kill_single_victim()), so it goes straight to the
+		 * productivity recheck below without this extra wait.
 		 */
 		if (!confirmed)
 			slmk_post_kill_grace();
+
+		if (memory_target_met())
+			break;
+
+		/*
+		 * We only reached this loop because run_reclaim_cascade()
+		 * already established that reclaim had failed to make
+		 * meaningful progress across slmk_reclaim_failure_threshold
+		 * consecutive critical windows. Re-check the same way after
+		 * this kill: kill_single_victim()/slmk_post_kill_grace()
+		 * above already ran real reclaim passes as a side effect of
+		 * the kill/reap path, so measure what they achieved. If
+		 * reclaim is productive again, this victim's death gave it
+		 * real room to work with -- stop here instead of continuing
+		 * through the rest of this batch. If it is still not
+		 * productive, this is a genuine ongoing exhaustion event and
+		 * another victim is considered, still bounded by
+		 * slmk_max_kills_per_cascade above.
+		 */
+		atomic_inc(&stat_reclaim_windows);
+		slmk_reclaim_snapshot(&after);
+		if (slmk_window_productive(&before, &after)) {
+			atomic_inc(&stat_reclaim_productive_windows);
+			slmk_nonproductive_windows = 0;
+			pr_info_ratelimited("Reclaim recovered after kill #%u; stopping this cascade's kill loop\n",
+					    killed);
+			break;
+		}
+		atomic_inc(&stat_reclaim_failed_windows);
 	}
 
 	/* Every candidate was pinned by find_victims(); release any that
@@ -853,7 +1057,6 @@ static void scan_and_kill_one_at_a_time(void)
 	if (killed >= slmk_max_kills_per_cascade)
 		pr_warn_ratelimited("Hit per-cascade kill cap (%u); stopping this cascade early\n",
 				    slmk_max_kills_per_cascade);
-
 }
 
 /* ---------------------------------------------------------------------
@@ -864,10 +1067,12 @@ static void run_reclaim_cascade(bool critical)
 {
 	unsigned int rounds = critical ? slmk_reclaim_rounds_critical
 					: slmk_reclaim_rounds_high;
+	struct slmk_reclaim_snapshot before, after;
 	unsigned long freed = 0;
 	unsigned int i;
 
 	atomic_inc(&stat_reclaim_attempts);
+	slmk_reclaim_snapshot(&before);
 
 	for (i = 0; i < rounds; i++) {
 		freed += direct_reclaim_pass();
@@ -876,8 +1081,10 @@ static void run_reclaim_cascade(bool critical)
 	}
 	atomic_long_add(freed, &stat_pages_freed);
 
-	if (!critical || memory_target_met())
+	if (!critical || memory_target_met()) {
+		slmk_nonproductive_windows = 0;
 		return;
+	}
 
 	/*
 	 * total_swap_pages is the total capacity of all currently-active
@@ -892,7 +1099,10 @@ static void run_reclaim_cascade(bool critical)
 	 * through reclaim alone until swap comes back. Rather than treat
 	 * that exactly like a normal critical/no-swap-ever device (where
 	 * killing immediately is correct), give it a brief chance to
-	 * resolve itself first.
+	 * resolve itself first. This is a distinct, structural condition
+	 * (no swap device active at all) from the reclaim-progress gate
+	 * below, which is about whether reclaim is productive given
+	 * whatever swap capacity does exist.
 	 */
 	if (total_swap_pages == 0) {
 		unsigned int waited = 0;
@@ -906,10 +1116,64 @@ static void run_reclaim_cascade(bool critical)
 		}
 
 		if (memory_target_met()) {
+			slmk_nonproductive_windows = 0;
 			pr_info_ratelimited("Memory recovered without killing while waiting for swap to return\n");
 			return;
 		}
 	}
+
+	/*
+	 * Still below minfree after the bounded reclaim-round loop above.
+	 * That alone has never been sufficient to authorize a kill in this
+	 * driver (see memory_target_met()'s callers), and it still isn't
+	 * here -- minfree only gates whether we are even considering
+	 * killing, not whether we are allowed to. Measure whether reclaim
+	 * actually made meaningful progress during this window before
+	 * deciding anything further; see slmk_reclaim_snapshot() and
+	 * slmk_window_productive() for exactly what "progress" means and
+	 * why the round budget elapsing is not treated as proof reclaim
+	 * has failed.
+	 */
+	atomic_inc(&stat_reclaim_windows);
+	slmk_reclaim_snapshot(&after);
+
+	if (slmk_window_productive(&before, &after)) {
+		atomic_inc(&stat_reclaim_productive_windows);
+		atomic_inc(&stat_kills_deferred);
+		slmk_nonproductive_windows = 0;
+		pr_info_ratelimited("Still below minfree but reclaim is productive this window (pgsteal +%lu, pswpout +%lu, free %+ld pages); giving it another window instead of killing\n",
+				    after.pgsteal - before.pgsteal,
+				    after.pswpout - before.pswpout,
+				    (long)after.free_pages - (long)before.free_pages);
+		return;
+	}
+
+	atomic_inc(&stat_reclaim_failed_windows);
+	slmk_nonproductive_windows++;
+
+	/*
+	 * A single non-productive window -- or even a single non-productive
+	 * cascade -- is not enough on its own to authorize a kill. Require
+	 * this to repeat for slmk_reclaim_failure_threshold consecutive
+	 * critical windows first. This bound is what keeps the policy from
+	 * ever becoming an unconditional "never kill": once genuinely
+	 * exhausted reclaim has been tolerated that many times in a row,
+	 * killing is allowed specifically to prevent starvation/OOM lockup
+	 * under sustained pressure, not because this proves compression or
+	 * reclaim can never succeed again.
+	 */
+	if (slmk_nonproductive_windows < slmk_reclaim_failure_threshold) {
+		atomic_inc(&stat_kills_deferred);
+		pr_info_ratelimited("Reclaim window produced no meaningful progress (%u/%u consecutive); giving it another window before considering a kill\n",
+				    slmk_nonproductive_windows,
+				    slmk_reclaim_failure_threshold);
+		return;
+	}
+
+	atomic_inc(&stat_reclaim_exhaustions);
+	pr_warn_ratelimited("Reclaim has produced no meaningful progress for %u consecutive critical windows; allowing a kill\n",
+			    slmk_nonproductive_windows);
+	slmk_nonproductive_windows = 0;
 
 	if (time_before(jiffies,
 			 last_kill_jiffies + msecs_to_jiffies(slmk_kill_cooldown_ms))) {
@@ -1173,11 +1437,21 @@ static int simple_lmk_stats_get(char *buf, const struct kernel_param *kp)
 		"pages_freed=%ld\n"
 		"kill_count=%d\n"
 		"protected_skips=%d\n"
+		"reclaim_windows=%d\n"
+		"reclaim_productive_windows=%d\n"
+		"reclaim_failed_windows=%d\n"
+		"reclaim_exhaustions=%d\n"
+		"kills_deferred=%d\n"
 		"last_victim=%s uid=%u adj=%d freed_kib=%lu\n",
 		atomic_read(&stat_reclaim_attempts),
 		atomic_long_read(&stat_pages_freed),
 		atomic_read(&stat_kill_count),
 		atomic_read(&stat_protected_skips),
+		atomic_read(&stat_reclaim_windows),
+		atomic_read(&stat_reclaim_productive_windows),
+		atomic_read(&stat_reclaim_failed_windows),
+		atomic_read(&stat_reclaim_exhaustions),
+		atomic_read(&stat_kills_deferred),
 		comm[0] ? comm : "(none)", uid, adj, kib);
 }
 
